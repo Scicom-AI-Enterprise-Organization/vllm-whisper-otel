@@ -847,14 +847,16 @@ class OutputProcessor:
 
     @staticmethod
     def _trace_phases(parent_span: Any, metrics: RequestStateStats) -> None:
-        """Queue, prefill and decode of ``llm_request`` as child spans.
+        """Input, queue, prefill and decode of ``llm_request`` as child spans.
 
-        Engine core stamps these phases with the host-wide monotonic clock, so
-        they are shifted onto wall-clock time before being exported.
+        Input runs from arrival (when rendering starts) to the engine core
+        queue. Engine core stamps the other phases with the host-wide
+        monotonic clock, so they are shifted onto wall-clock time for export.
         """
         context = extract_trace_context(trace_headers_for_span(parent_span))
         mono_to_wall = time.time() - time.monotonic()
         for name, start, end in (
+            ("input", metrics.arrival_time - mono_to_wall, metrics.queued_ts),
             ("queue", metrics.queued_ts, metrics.scheduled_ts),
             ("prefill", metrics.scheduled_ts, metrics.first_token_ts),
             ("decode", metrics.first_token_ts, metrics.last_token_ts),
