@@ -4,10 +4,11 @@
 import atexit
 import functools
 import inspect
+import logging
 import os
 import traceback
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 from vllm.logger import init_logger
@@ -87,8 +88,49 @@ def init_otel_tracer(
 
     atexit.register(trace_provider.shutdown)
 
+    if logs_endpoint := os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
+        init_otel_log_export(logs_endpoint, resource)
+
     tracer = trace_provider.get_tracer(instrumenting_module_name)
     return tracer
+
+
+def init_otel_log_export(logs_endpoint: str, resource: Any) -> None:
+    """Also export the ``vllm`` logger's records over OTLP.
+
+    A record emitted while a span is current carries that span's trace and
+    span ids, so the logs of a traced request can be found by its trace id.
+    """
+    from opentelemetry._logs import set_logger_provider
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+
+    protocol = os.environ.get(
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc"),
+    )
+    if protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+            OTLPLogExporter as OTLPGrpcLogExporter,
+        )
+
+        exporter = OTLPGrpcLogExporter(endpoint=logs_endpoint, insecure=True)
+    elif protocol == "http/protobuf":
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+            OTLPLogExporter as OTLPHttpLogExporter,
+        )
+
+        exporter = OTLPHttpLogExporter(endpoint=logs_endpoint)
+    else:
+        raise ValueError(f"Unsupported OTLP protocol '{protocol}' is configured")
+
+    log_provider = LoggerProvider(resource=resource)
+    log_provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
+    set_logger_provider(log_provider)
+    atexit.register(log_provider.shutdown)
+    logging.getLogger("vllm").addHandler(
+        LoggingHandler(level=logging.INFO, logger_provider=log_provider)
+    )
 
 
 def get_span_exporter(endpoint):
@@ -229,6 +271,13 @@ def manual_instrument_otel(
     else:
         span.end()
     return span
+
+
+def use_otel_span(span: Any):
+    """Make ``span`` current without ending it, so log records carry its ids."""
+    if not _IS_OTEL_AVAILABLE or span is None:
+        return nullcontext()
+    return trace.use_span(span, end_on_exit=False, record_exception=False)
 
 
 def otel_trace_headers_for_span(span: Any) -> dict[str, str]:

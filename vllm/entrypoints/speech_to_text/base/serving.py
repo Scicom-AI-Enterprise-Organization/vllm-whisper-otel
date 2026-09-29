@@ -44,6 +44,7 @@ from vllm.tracing import (
     instrument_manual,
     start_span,
     trace_headers_for_span,
+    use_span,
 )
 from vllm.utils.async_utils import make_async_with_semaphore, merge_async_iterators
 from vllm.v1.sample.logits_processor.forced_prefix import (
@@ -537,14 +538,22 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             trace_headers = trace_headers_for_span(span) or trace_headers
 
         try:
-            response = await self._run_speech_to_text(
-                audio_data,
-                request,
-                raw_request,
-                response_class,
-                stream_generator_method,
-                trace_headers,
-            )
+            with use_span(span):
+                response = await self._run_speech_to_text(
+                    audio_data,
+                    request,
+                    raw_request,
+                    response_class,
+                    stream_generator_method,
+                    trace_headers,
+                )
+                if span is not None and not isinstance(response, AsyncGenerator):
+                    logger.info(
+                        "Speech-to-text %s done: language=%s, response_format=%s",
+                        self.task_type,
+                        request.language,
+                        request.response_format,
+                    )
         except BaseException as e:
             if span is not None:
                 span.record_exception(e)
