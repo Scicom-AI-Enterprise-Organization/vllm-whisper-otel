@@ -5,7 +5,7 @@ import io
 import math
 import time
 import zlib
-from collections.abc import AsyncGenerator, Callable, Set
+from collections.abc import AsyncGenerator, Callable, Mapping, Set
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import Final, Literal, TypeAlias, TypeVar, cast
@@ -38,7 +38,18 @@ from vllm.renderers.inputs import DictPrompt, EncoderDecoderDictPrompt
 from vllm.renderers.inputs.preprocess import parse_enc_dec_prompt, parse_model_prompt
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import get_tokenizer
+from vllm.tracing import (
+    SpanKind,
+    extract_trace_context,
+    instrument_manual,
+    start_span,
+    trace_headers_for_span,
+)
 from vllm.utils.async_utils import make_async_with_semaphore, merge_async_iterators
+from vllm.v1.sample.logits_processor.forced_prefix import (
+    FORCED_PREFIX_KEY,
+    ForcedPrefixLogitsProcessor,
+)
 
 from ..transcription.protocol import (
     TranscriptionResponse,
@@ -140,6 +151,19 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 self.default_sampling_params,
             )
 
+        # Keyed by whether timestamps are on (response_format == "verbose_json").
+        self.detect_and_transcribe_prefixes: dict[bool, list[list[int]]] | None = None
+        if self._can_detect_and_transcribe():
+            self.detect_and_transcribe_prefixes = {
+                timestamps: self.model_cls.get_detect_and_transcribe_prefix(
+                    self.tokenizer, task_type, timestamps
+                )
+                for timestamps in (False, True)
+            }
+            logger.info(
+                "Language auto-detection runs inside the %s request.", task_type
+            )
+
         # setup preprocess resources
         # we keep separate thread pool for frontend preprocessing instead
         # of reusing the one from Renderer which showed lower throughput
@@ -162,6 +186,35 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
     def shutdown(self) -> None:
         self._preprocess_executor.shutdown(wait=False)
+
+    def _can_detect_and_transcribe(self) -> bool:
+        """Detecting the language in the transcription request itself needs a
+        model that can build that prompt and an engine that loaded
+        ``ForcedPrefixLogitsProcessor``. Without both, detection costs a
+        separate engine request with its own encoder pass."""
+        if not hasattr(self.model_cls, "get_detect_and_transcribe_prompt"):
+            return False
+        name = ForcedPrefixLogitsProcessor.__name__
+        return any(
+            lp is ForcedPrefixLogitsProcessor
+            or (isinstance(lp, str) and lp.rsplit(":", 1)[-1] == name)
+            for lp in self.model_config.logits_processors or ()
+        )
+
+    @staticmethod
+    def _trace_stage(
+        span_name: str,
+        start_time_ns: int,
+        trace_headers: Mapping[str, str] | None,
+        attributes: dict[str, str | int | float] | None = None,
+    ) -> None:
+        if trace_headers is not None:
+            instrument_manual(
+                span_name=span_name,
+                start_time=start_time_ns,
+                attributes=attributes,
+                context=extract_trace_context(trace_headers),
+            )
 
     def _decode_and_chunk_speech(
         self,
@@ -211,6 +264,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         self,
         audio_chunk: np.ndarray,
         request_id: str,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> str:
         """Auto-detect the spoken language from an audio chunk.
 
@@ -235,6 +289,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             prompt,
             sampling_params,
             request_id,
+            trace_headers=trace_headers,
         )
 
         try:
@@ -263,7 +318,8 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         request: SpeechToTextRequest,
         audio_data: bytes,
         request_id: str,
-    ) -> tuple[list[EngineInput], float, list[float]]:
+        trace_headers: Mapping[str, str] | None = None,
+    ) -> tuple[list[EngineInput], float, list[float], list[list[int]] | None]:
         # Validate request
         request.language = self.model_cls.validate_language(request.language)
         request.to_language = (
@@ -273,7 +329,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         )
 
         # Run cpu intensive preprocess step in a separate thread pool executor.
+        start_ns = time.time_ns()
         chunks, duration = await self._decode_and_chunk_speech_async(audio_data)
+        self._trace_stage(
+            "stt.audio_decode",
+            start_ns,
+            trace_headers,
+            {"stt.audio_duration_s": duration, "stt.num_chunks": len(chunks)},
+        )
 
         chunk_start_offsets: list[float] = [0.0]
 
@@ -282,14 +345,29 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 chunk_start_offsets[-1] + chunk.shape[-1] / self.asr_config.sample_rate
             )
 
+        forced_prefix: list[list[int]] | None = None
+        language_detection = "none"
         if request.language is None and getattr(
             self.model_cls, "supports_explicit_language_detection", False
         ):
-            # Auto-detect language from the first chunk.
-            request.language = await self._detect_language(
-                chunks[0], f"{request_id}-lang_detect"
-            )
+            if (
+                self.detect_and_transcribe_prefixes is not None
+                and len(chunks) == 1
+                and not request.stream
+                and not request.use_beam_search
+            ):
+                language_detection = "in_request"
+                forced_prefix = self.detect_and_transcribe_prefixes[
+                    request.response_format == "verbose_json"
+                ]
+            else:
+                language_detection = "separate_request"
+                # Auto-detect language from the first chunk.
+                request.language = await self._detect_language(
+                    chunks[0], f"{request_id}-lang_detect", trace_headers
+                )
 
+        start_ns = time.time_ns()
         parsed_prompts: list[DictPrompt] = []
         for chunk in chunks:
             stt_params = request.build_stt_params(
@@ -298,7 +376,10 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 model_config=self.model_config,
                 task_type=self.task_type,
             )
-            prompt = self.model_cls.get_generation_prompt(stt_params)
+            if forced_prefix is not None:
+                prompt = self.model_cls.get_detect_and_transcribe_prompt(stt_params)
+            else:
+                prompt = self.model_cls.get_generation_prompt(stt_params)
 
             parsed_prompt: DictPrompt
             if request.response_format == "verbose_json":
@@ -310,8 +391,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             parsed_prompts.append(parsed_prompt)
 
         engine_inputs = await self.renderer.render_cmpl_async(parsed_prompts)
+        self._trace_stage(
+            "stt.prompt",
+            start_ns,
+            trace_headers,
+            {"stt.language_detection": language_detection},
+        )
 
-        return engine_inputs, duration, chunk_start_offsets
+        return engine_inputs, duration, chunk_start_offsets, forced_prefix
 
     def _preprocess_verbose_prompt(self, prompt: EncoderDecoderDictPrompt):
         dec_prompt = prompt["decoder_prompt"]
@@ -427,7 +514,73 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         stream_generator_method: Callable[..., AsyncGenerator[str, None]],
     ) -> T | V | AsyncGenerator[str, None] | ErrorResponse:
         """Base method for speech-to-text operations like transcription and
-        translation."""
+        translation.
+
+        With tracing on, the request gets an ``stt.request`` span that parents
+        the preprocessing spans and every engine request it makes."""
+        trace_headers = (
+            None
+            if raw_request is None
+            else await self._get_trace_headers(raw_request.headers)
+        )
+        span = None
+        if trace_headers is not None:
+            span = start_span(
+                "stt.request",
+                context=extract_trace_context(trace_headers),
+                kind=SpanKind.SERVER,
+                attributes={
+                    "stt.task": self.task_type,
+                    "stt.response_format": request.response_format,
+                },
+            )
+            trace_headers = trace_headers_for_span(span) or trace_headers
+
+        try:
+            response = await self._run_speech_to_text(
+                audio_data,
+                request,
+                raw_request,
+                response_class,
+                stream_generator_method,
+                trace_headers,
+            )
+        except BaseException as e:
+            if span is not None:
+                span.record_exception(e)
+                span.set_attribute("error.type", type(e).__name__)
+                span.end()
+            raise
+
+        if span is None:
+            return response
+        if isinstance(response, AsyncGenerator):
+            return self._end_span_after_stream(response, span)
+        span.set_attribute("stt.language", request.language or "")
+        if isinstance(response, ErrorResponse):
+            span.set_attribute("error.type", "ErrorResponse")
+        span.end()
+        return response
+
+    @staticmethod
+    async def _end_span_after_stream(
+        stream: AsyncGenerator[str, None], span
+    ) -> AsyncGenerator[str, None]:
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            span.end()
+
+    async def _run_speech_to_text(
+        self,
+        audio_data: bytes,
+        request: SpeechToTextRequest,
+        raw_request: Request,
+        response_class: type[ResponseType],
+        stream_generator_method: Callable[..., AsyncGenerator[str, None]],
+        trace_headers: Mapping[str, str] | None,
+    ) -> T | V | AsyncGenerator[str, None] | ErrorResponse:
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -488,10 +641,12 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             engine_inputs,
             duration_s,
             chunk_start_offsets,
+            forced_prefix,
         ) = await self._preprocess_speech_to_text(
             request=request,
             audio_data=audio_data,
             request_id=request_id,
+            trace_headers=trace_headers,
         )
 
         # Schedule the request and get the result generator.
@@ -528,6 +683,16 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         if request.response_format == "verbose_json":
             sampling_params.logprobs = 1
 
+        if forced_prefix is not None:
+            assert isinstance(sampling_params, SamplingParams)
+            sampling_params.extra_args = {
+                **(sampling_params.extra_args or {}),
+                FORCED_PREFIX_KEY: forced_prefix,
+            }
+            # The prefix tokens are generated now instead of being in the prompt.
+            if sampling_params.max_tokens is not None:
+                sampling_params.max_tokens += len(forced_prefix)
+
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
             for idx in range(len(engine_inputs))
@@ -540,12 +705,6 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     engine_input,
                     params=sampling_params,
                     lora_request=lora_request,
-                )
-
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
                 )
 
                 if isinstance(sampling_params, BeamSearchParams):
@@ -612,14 +771,24 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             result_generator = merge_async_iterators(*list_result_generator)
             async for idx, op in result_generator:
                 start_time = chunk_start_offsets[idx]
+                token_ids = tuple(op.outputs[0].token_ids)
+                log_probs = op.outputs[0].logprobs
+                if forced_prefix is not None and token_ids:
+                    request.language = self.model_cls.parse_language_detection_output(
+                        list(token_ids[:1]), self.tokenizer
+                    )
+                    logger.info("Auto-detected language: '%s'", request.language)
+                    token_ids = token_ids[len(forced_prefix) :]
+                    if log_probs:
+                        log_probs = log_probs[len(forced_prefix) :]
                 if request.response_format == "verbose_json":
-                    assert op.outputs[0].logprobs
+                    assert log_probs
                     segments: list[SpeechToTextSegment] = self._get_verbose_segments(
-                        tokens=tuple(op.outputs[0].token_ids),
+                        tokens=token_ids,
                         segment_class=segment_class,
                         request=request,
                         start_time=start_time,
-                        log_probs=op.outputs[0].logprobs,
+                        log_probs=log_probs,
                     )
 
                     chunk_segment_parts[idx].extend(segments)

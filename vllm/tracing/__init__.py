@@ -16,6 +16,8 @@ from .otel import (
     manual_instrument_otel,
     otel_import_error_traceback,
 )
+from .otel import otel_trace_headers_for_span as trace_headers_for_span
+from .otel import start_otel_span as start_span
 from .utils import (
     SpanAttributes,
     contains_trace_headers,
@@ -29,6 +31,8 @@ __all__ = [
     "init_tracer",
     "maybe_init_worker_tracer",
     "is_tracing_available",
+    "start_span",
+    "trace_headers_for_span",
     "SpanAttributes",
     "SpanKind",
     "extract_trace_context",

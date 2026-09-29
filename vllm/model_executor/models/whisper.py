@@ -921,6 +921,49 @@ class WhisperForConditionalGeneration(
         )
 
     @classmethod
+    def get_detect_and_transcribe_prompt(
+        cls,
+        stt_params: SpeechToTextParams,
+    ) -> PromptType:
+        """Prompt that detects the language and transcribes in one request.
+
+        The decoder prompt stops at ``<|startoftranscript|>``. The language,
+        task and timestamp tokens that ``get_generation_prompt`` would put in
+        the prompt are generated instead, constrained by the ids from
+        ``get_detect_and_transcribe_prefix``.
+        """
+        request_prompt = stt_params.request_prompt
+        decoder_text = (
+            f"<|prev|>{request_prompt}" if request_prompt else ""
+        ) + "<|startoftranscript|>"
+
+        return ExplicitEncoderDecoderPrompt(
+            encoder_prompt=TextPrompt(
+                prompt="",
+                multi_modal_data={
+                    "audio": (stt_params.audio, stt_params.stt_config.sample_rate)
+                },
+            ),
+            decoder_prompt=TextPrompt(prompt=decoder_text),
+        )
+
+    @classmethod
+    def get_detect_and_transcribe_prefix(
+        cls,
+        tokenizer: object,
+        task_type: str,
+        timestamps: bool,
+    ) -> list[list[int]]:
+        """Allowed ids for the first three generated tokens: any language,
+        then the task, then ``<|0.00|>`` or ``<|notimestamps|>``."""
+        timestamp_token = "<|0.00|>" if timestamps else "<|notimestamps|>"
+        return [
+            cls.get_language_token_ids(tokenizer),
+            [tokenizer.convert_tokens_to_ids(f"<|{task_type}|>")],
+            [tokenizer.convert_tokens_to_ids(timestamp_token)],
+        ]
+
+    @classmethod
     def parse_language_detection_output(
         cls,
         token_ids: list[int],

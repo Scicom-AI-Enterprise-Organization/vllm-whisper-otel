@@ -180,17 +180,16 @@ def instrument_otel(func, span_name, attributes, record_exception):
     return async_wrapper if inspect.iscoroutinefunction(func) else sync_wrapper
 
 
-def manual_instrument_otel(
+def start_otel_span(
     span_name: str,
-    start_time: int,
-    end_time: int | None = None,
+    start_time: int | None = None,
     attributes: dict[str, Any] | None = None,
     context: Context | None = None,
     kind: Any = None,  # SpanKind, but typed as Any for when OTEL unavailable
 ):
-    """Manually create and end a span with explicit timestamps."""
+    """Start a span that the caller must end."""
     if not _IS_OTEL_AVAILABLE:
-        return
+        return None
 
     tracer = trace.get_tracer(__name__)
     # Use provided context, or fall back to smart context detection
@@ -207,10 +206,39 @@ def manual_instrument_otel(
     span = tracer.start_span(**span_kwargs)
     if attributes:
         span.set_attributes(attributes)
+    return span
+
+
+def manual_instrument_otel(
+    span_name: str,
+    start_time: int,
+    end_time: int | None = None,
+    attributes: dict[str, Any] | None = None,
+    context: Context | None = None,
+    kind: Any = None,  # SpanKind, but typed as Any for when OTEL unavailable
+):
+    """Manually create and end a span with explicit timestamps.
+
+    Returns the ended span, so callers can parent child spans on it.
+    """
+    span = start_otel_span(span_name, start_time, attributes, context, kind)
+    if span is None:
+        return None
     if end_time is not None:
         span.end(end_time=end_time)
     else:
         span.end()
+    return span
+
+
+def otel_trace_headers_for_span(span: Any) -> dict[str, str]:
+    """W3C trace headers that make ``span`` the parent of downstream spans."""
+    carrier: dict[str, str] = {}
+    if _IS_OTEL_AVAILABLE and span is not None:
+        TraceContextTextMapPropagator().inject(
+            carrier, context=trace.set_span_in_context(span)
+        )
+    return carrier
 
 
 def _get_smart_context() -> Context | None:
