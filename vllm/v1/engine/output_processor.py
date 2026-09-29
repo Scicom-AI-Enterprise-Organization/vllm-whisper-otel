@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from vllm.tracing import (
     SpanKind,
     extract_trace_context,
     instrument_manual,
+    trace_headers_for_span,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -833,13 +835,37 @@ class OutputProcessor:
         if req_state.n:
             attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
 
-        instrument_manual(
+        span = instrument_manual(
             span_name="llm_request",
             start_time=arrival_time_ns,
             attributes=attributes,
             context=trace_context,
             kind=SpanKind.SERVER,
         )
+        if span is not None:
+            self._trace_phases(span, metrics)
+
+    @staticmethod
+    def _trace_phases(parent_span: Any, metrics: RequestStateStats) -> None:
+        """Queue, prefill and decode of ``llm_request`` as child spans.
+
+        Engine core stamps these phases with the host-wide monotonic clock, so
+        they are shifted onto wall-clock time before being exported.
+        """
+        context = extract_trace_context(trace_headers_for_span(parent_span))
+        mono_to_wall = time.time() - time.monotonic()
+        for name, start, end in (
+            ("queue", metrics.queued_ts, metrics.scheduled_ts),
+            ("prefill", metrics.scheduled_ts, metrics.first_token_ts),
+            ("decode", metrics.first_token_ts, metrics.last_token_ts),
+        ):
+            if 0 < start < end:
+                instrument_manual(
+                    span_name=f"llm_request.{name}",
+                    start_time=int((start + mono_to_wall) * 1e9),
+                    end_time=int((end + mono_to_wall) * 1e9),
+                    context=context,
+                )
 
     def _update_stats_from_output(
         self,
